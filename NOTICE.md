@@ -7,11 +7,9 @@ and are **not** redistributed in this repository:
 | Package | License | Project home |
 |---|---|---|
 | NumPy | BSD-3-Clause | <https://numpy.org> |
-| SciPy | BSD-3-Clause | <https://scipy.org> |
-| pandas | BSD-3-Clause | <https://pandas.pydata.org> |
 | scikit-learn | BSD-3-Clause | <https://scikit-learn.org> |
-| matplotlib | Matplotlib License (BSD-style, PSF-derived) | <https://matplotlib.org> |
 | pytest (development only) | MIT | <https://pytest.org> |
+| ruff (development only) | MIT | <https://docs.astral.sh/ruff/> |
 
 Each package is governed by its own license terms, which are distributed with the
 package itself.

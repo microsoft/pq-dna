@@ -54,8 +54,8 @@ condition state.
 python -m pip install -e .
 ```
 
-Requires Python 3.9+. Runtime dependencies are NumPy, SciPy, pandas and
-scikit-learn. For development extras:
+Requires Python 3.9+. Runtime dependencies are NumPy and scikit-learn.
+For development extras:
 
 ```bash
 python -m pip install -e ".[dev]"
