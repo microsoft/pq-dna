@@ -1,12 +1,14 @@
 """Synthetic dataset generator for a fleet of smart meters.
 
 The generator instantiates `N` virtual meters each with a randomly drawn
-electrical environment (urban / EV-corridor / industrial / clean-grid),
-streams plausible voltage / current waveforms for a multi-year horizon,
-runs them through the same feature extractor and PQ-DNA aggregator that the
-firmware would use, and emits per-meter snapshots of:
+electrical environment (urban / EV-corridor / industrial / clean-grid) and
+per-component robustness. No waveforms are synthesised: for each day of a
+multi-year horizon it draws the environment's expected daily feature vector,
+applies the device's damage kernel and EWMA with a 1-day step (the firmware
+runs the same recursion with a 1 s step), and emits weekly per-meter snapshots
+of:
 
-    (timestamp, PQ-DNA state, true component-health, failure events)
+    (day, PQ-DNA state, true component-health, failure events)
 
 so downstream models (CHS, RUL) have labelled supervision.
 
@@ -28,18 +30,25 @@ Two generators are provided, selected with the ``generator`` argument:
        an EWMA, i.e. a *stress-level* estimate that reaches steady state and
        then stays flat. The two are fundamentally different functionals of the
        same input stream, and this is the single most important mismatch.
-    3. *Non-linear dose-to-damage link.* Health follows ``exp(-(L/L_ref)**m)``
-       with a per-component shape exponent ``m``, not ``clip(1 - W.S)``.
+    3. *Non-linear dose-to-damage link.* Health follows
+       ``CHS_c = exp(-D~_c)`` with ``D_c = (L_c / (L_ref_c * r_c))**m_c`` (``L_c``
+       the cumulative dose, ``L_ref_c`` the characteristic life, ``r_c`` the
+       per-meter robustness and ``m_c`` a per-component shape exponent) and
+       ``D~_c`` equal to ``D_c`` plus the coupling term of item 4, not
+       ``clip(1 - W.S)``.
     4. *Cross-component coupling.* A degrading SMPS accelerates MCU and
-       display aging, and so on. The estimator treats components independently.
+       display aging, and so on: ``D~_c = D_c + kappa_c * D_src(c)`` with the
+       source's uncoupled damage (:data:`LATENT_COUPLING`). The estimator
+       treats components independently.
 
     Additionally the device-visible S vector carries multiplicative sensor
     noise, so the estimator does not even observe the same S the latent
     process was driven by.
 
 ``"matched"``
-    The original generator: ground truth is ``clip(1 - W.S * scale / r)`` using
-    the *same* ``W`` the estimator is initialised with and later fits. This is
+    The original generator: ground truth is ``clip(1 - (5.5e-3 / r_c) * w_c . S)``
+    using the *same* weights ``w_c`` (`FAILURE_MODES`) the estimator is
+    initialised with and later fits. This is
     retained **only** so the demo can quantify how much of the previously
     reported accuracy was an artefact of model matching. It must not be used
     to report headline accuracy.
@@ -61,7 +70,7 @@ from .features import (
     FEATURE_NAMES,
     N_FEATURES,
 )
-from .pqdna import PQDNAAggregator, PQDNAState, vectorised_damage
+from .pqdna import PQDNAAggregator, vectorised_damage
 
 # A small catalogue of typical environments. Each describes the *intensity*
 # of the various PQ stressors that meters in that environment experience.
@@ -127,10 +136,11 @@ LATENT_SHAPE_M: Dict[str, float] = {
 }
 
 # Characteristic life expressed as years of nominal `urban_residential`
-# exposure required to reach unit normalised damage (CHS = 1/e).
-# Calibrated so a 15-year fleet run yields a ~13% cumulative failure rate,
-# consistent with the ~0.6%/yr premature-failure rate reported for this class
-# of equipment. Harsh environments dominate the failures.
+# exposure required to reach unit normalised damage (CHS = 1/e before
+# coupling). Calibrated so a 15-year fleet run yields a 13.7% cumulative
+# failure rate (first CHS < 0.05; demo fleet of 300 meters, seed 42). That
+# rate is an illustrative choice for the demonstration, not a field statistic.
+# Harsh environments dominate the failures.
 LATENT_LIFE_URBAN_YEARS: Dict[str, float] = {
     "relay": 105.0,
     "smps": 120.0,
@@ -141,7 +151,8 @@ LATENT_LIFE_URBAN_YEARS: Dict[str, float] = {
 
 # Cross-component coupling: degrading `source` accelerates `target`.
 # (target -> (source, kappa)). The CHS estimator models components
-# independently and therefore cannot represent this term.
+# independently and therefore cannot represent this term. It is applied to the
+# source's uncoupled damage: D~_target = D_target + kappa * D_source.
 LATENT_COUPLING: Dict[str, Tuple[str, float]] = {
     "mcu": ("smps", 0.35),
     "display": ("smps", 0.20),
@@ -159,6 +170,10 @@ def latent_dose(features: np.ndarray) -> np.ndarray:
     Deliberately uses different gains and exponents from the device-side
     :func:`pqdna.vectorised_damage`, so that no exact linear recovery of the
     latent process from S is possible.
+
+    The dose of channel ``k`` is ``LATENT_DOSE_GAIN[k] * xt_k ** LATENT_DOSE_EXP[k]``
+    with ``xt_0 = |x_0 - 1|``, ``xt_4 = max(x_4 - 1.414, 0)`` and
+    ``xt_k = max(x_k, 0)`` otherwise.
 
     Parameters
     ----------
@@ -193,7 +208,9 @@ def _reference_characteristic_life(comp_W: np.ndarray) -> np.ndarray:
 
     Anchored to the mean daily dose of a nominal ``urban_residential`` meter so
     the constants in :data:`LATENT_LIFE_URBAN_YEARS` are interpretable as
-    "years of nominal urban exposure to reach CHS = 1/e".
+    "years of nominal urban exposure to reach CHS = 1/e" (before coupling):
+    ``L_ref_c = 365 * Y_c * (w_c . latent_dose(x_bar))`` with ``x_bar`` the mean
+    ``urban_residential`` feature vector and ``Y_c`` the anchor in years.
     """
     p = ENVIRONMENTS["urban_residential"]
     mean_feats = np.array(
@@ -252,7 +269,8 @@ def _latent_chs_trajectory(
     m = np.array([LATENT_SHAPE_M[c] for c in COMPONENTS], dtype=np.float64)
     D = np.power(np.maximum(u, 0.0), m[None, :])            # (n_days, n_comp)
 
-    # Cross-component coupling, applied on the normalised damage.
+    # Cross-component coupling, applied on the normalised damage: each target
+    # adds kappa times its source's uncoupled D (no cascading).
     D_coupled = D.copy()
     for ci, c in enumerate(COMPONENTS):
         if c in LATENT_COUPLING:
@@ -270,8 +288,9 @@ def _matched_chs_trajectory(
     """Legacy model-matched ground truth. Retained for ablation only.
 
     This reproduces the original generator: CHS is an exactly linear function
-    of the same S the estimator sees, using the same weight matrix the
-    estimator fits. Accuracy measured against this target is close to
+    of the same S the estimator sees, using the same weights the estimator
+    fits: ``CHS_c = clip(1 - (5.5e-3 / r_c) * w_c . S, 0, 1)`` with S the
+    noise-free device state. Accuracy measured against this target is close to
     tautological and must not be reported as a headline result.
     """
     damage = (S_hist @ comp_W.T) * 5.5e-3 / robustness[None, :]
@@ -291,20 +310,24 @@ class MeterTrace:
 
 
 class _AcceleratedSimulator:
-    """Closed-form damage simulator that bypasses 12,000 hr of waveform.
+    """Closed-form damage simulator that bypasses years of waveform.
 
     Rather than synthesising literal 1-second waveforms for years of meter
-    life (computationally prohibitive), we draw the EXPECTED per-day damage
-    dose for each PQ-DNA dimension given the environment, and use the same
-    EWMA update rule the on-meter aggregator uses, but with a 1-day window.
+    life (computationally prohibitive), we draw the EXPECTED daily feature
+    vector for each PQ-DNA dimension given the environment, and use the same
+    EWMA update rule and damage kernel the on-meter aggregator uses, but with a
+    1-day step. This makes multi-year fleet simulation tractable.
 
-    This keeps the math IDENTICAL to the on-meter aggregator (same alpha,
-    same g(.)) while making 30-year fleet simulation tractable.
+    The daily decay is ``alpha_day = exp(-86400 / tau)`` in float64, from the
+    aggregator's time constants. It is exactly what 86,400 one-second updates
+    with a constant input produce, so each channel has its nominal time constant
+    (1, 7, 30 and 60 days by default); see docs/METHOD.md, Section 2.3.
     """
 
     def __init__(self, agg_for_feature_order: PQDNAAggregator) -> None:
-        # alpha_day = alpha_sec ** (seconds_per_day)
-        self.alpha = agg_for_feature_order.alpha ** 86400.0
+        # alpha_day = exp(-seconds_per_day / tau) is exact; alpha_1s ** seconds_per_day
+        # would multiply any rounding error of alpha_1s by 86,400.
+        self.alpha = np.exp(-86400.0 / agg_for_feature_order.tau)
 
     def _draw_features_batch(
         self, env: MeterEnvironment, n_days: int, rng: np.random.Generator
@@ -356,26 +379,14 @@ class _AcceleratedSimulator:
         )
 
 
-def _true_chs_from_state(state: PQDNAState, robustness: Dict[str, float]) -> np.ndarray:
-    """Legacy single-snapshot model-matched CHS. Deprecated.
-
-    Retained so existing callers keep working. New code should use
-    :meth:`SyntheticMeterFleet.simulate`, which drives the latent
-    (``"mismatched"``) generator by default.
-    """
-    out = np.zeros(len(COMPONENTS), dtype=np.float32)
-    for ci, c in enumerate(COMPONENTS):
-        damage = 0.0
-        for name, w in FAILURE_MODES[c].items():
-            idx = FEATURE_NAMES.index(name)
-            damage += w * float(state.S[idx])
-        r = robustness.get(c, 1.0)
-        out[ci] = float(np.clip(1.0 - (damage * 1.5e-3) / r, 0.0, 1.0))
-    return out
-
-
 class SyntheticMeterFleet:
-    """Generates a fleet of N simulated meters with daily CHS snapshots."""
+    """Generates a fleet of N simulated meters with weekly CHS snapshots.
+
+    The state is advanced once per day (see `_AcceleratedSimulator`) over
+    ``int(years * 365)`` days and a snapshot is recorded every 7 days. A meter
+    fails at the first snapshot at which any component's CHS is below 0.05; its
+    history is truncated one snapshot later.
+    """
 
     def __init__(
         self,
@@ -389,6 +400,15 @@ class SyntheticMeterFleet:
         """
         Parameters
         ----------
+        n_meters : int, default 200
+            Number of simulated meters.
+        years : float, default 12.0
+            Horizon in years; the simulation runs ``int(years * 365)`` days.
+        seed : int, default 7
+            Seed of the master random generator.
+        env_mix : dict, optional
+            Probability of each environment; defaults to 20% clean grid, 45%
+            urban residential, 20% EV corridor and 15% industrial welder.
         generator : {"mismatched", "matched"}
             Ground-truth degradation model. ``"mismatched"`` (default) uses the
             latent process described in the module docstring. ``"matched"``
@@ -411,8 +431,7 @@ class SyntheticMeterFleet:
             "ev_corridor": 0.20,
             "industrial_welder": 0.15,
         }
-        # one aggregator instance (carries alpha/tau);
-        # we'll repeatedly clone PQDNAState.
+        # one aggregator instance (carries the per-channel time constants).
         self.agg = PQDNAAggregator(dt_window_s=1.0)
         self._sim = _AcceleratedSimulator(self.agg)
 
@@ -447,8 +466,10 @@ class SyntheticMeterFleet:
             feats = self._sim._draw_features_batch(env, days, rng)   # (days, N_FEATURES)
             damage = vectorised_damage(feats)                        # (days, N_FEATURES)
 
-            # Device-side EWMA. This is the PQ-DNA state the firmware holds.
-            S = np.zeros(N_FEATURES, dtype=np.float32)
+            # Device-side EWMA, advanced once per day with alpha_day. This is the
+            # PQ-DNA state the firmware holds; it is carried in float64 and the
+            # history is stored in float32.
+            S = np.zeros(N_FEATURES, dtype=np.float64)
             S_hist = np.empty((days, N_FEATURES), dtype=np.float32)
             for d in range(days):
                 S = alpha_day * S + (1.0 - alpha_day) * damage[d]
@@ -504,6 +525,10 @@ class SyntheticMeterFleet:
         traces: Iterable[MeterTrace],
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Flatten all snapshots into ``(S, CHS, ttf_days, age_days)``.
+
+        ``ttf_days`` is the number of days from each snapshot to the meter's
+        failure day (0 at the failing snapshot, negative at the one kept after
+        it), or to its last snapshot for meters that never fail (right-censored).
 
         ``age_days`` is the device's own elapsed operating time, which is
         available on any real device for free (it already keeps a run-hour

@@ -1,21 +1,25 @@
 """Remaining-Useful-Life estimator.
 
-We frame RUL as a per-component regression: given the PQ-DNA snapshot S_t
-and the per-component CHS_t trajectory observed in the recent window,
-predict the number of days until CHS_i crosses the maintenance threshold
-(default 0.20).
+RUL is framed as a regression from the current snapshot to the number of days
+until failure. The inputs are the PQ-DNA state S (12 values), the per-component
+health scores CHS (5 values) and the device age in years (run-days / 365); the
+target ``ttf_days`` is supplied by the caller. In `pqdna.demo` it is the number
+of days to the first weekly snapshot at which any component's CHS falls below
+0.05 (devices that never fail contribute the days to the end of the horizon,
+right-censored), and the CHS inputs are the simulator's ground-truth scores
+rather than the output of `ComponentHealthScorer`.
 
-Two model heads are provided:
+Two model heads are provided, both fitted to the same target:
 
-  * `RULEstimator(model='ridge')`  - per-component closed-form linear model
-                                      that fits cleanly on a meter MCU
-                                      (8 ints + 1 bias per component).
+  * `RULEstimator(model='ridge')`  - one closed-form linear model,
+        RUL = max(0, beta . [S, CHS, age_years, 1]),
+    with 19 coefficients (12 + 5 + 1 + intercept) shared by all components,
+    which the fixed-point export of `pqdna.edge_export` stores in 77 bytes.
   * `RULEstimator(model='gbr')`    - sklearn GradientBoostingRegressor for
-                                      higher accuracy in the cloud-side
-                                      reference.
+    higher accuracy in the cloud-side reference.
 
 The ridge variant is the firmware-resident model. The GBR variant is a
-cloud-side reference for benchmarking only.
+cloud-side reference for benchmarking only. See docs/METHOD.md, Section 3.3.
 """
 
 # Copyright (c) Microsoft Corporation.
@@ -39,15 +43,27 @@ from .chs import COMPONENTS
 
 @dataclass
 class RULEstimator:
+    """Ridge or gradient-boosting regressor of days-to-failure.
+
+    Parameters
+    ----------
+    model : {"ridge", "gbr"}, default "ridge"
+        Model head (see the module docstring). The failure criterion is not a
+        parameter of the estimator: it is defined by the ``ttf_days`` target
+        passed to `fit` (CHS < 0.05 in `pqdna.demo`).
+    l2 : float, default 0.1
+        Ridge penalty, applied to the intercept as well as the coefficients
+        (`pqdna.demo` uses 10).
+    """
     model: Literal["ridge", "gbr"] = "ridge"
-    threshold: float = 0.20
     l2: float = 1e-1
-    coefs_: Optional[np.ndarray] = field(default=None, repr=False)       # ridge: (n_components, n_features+1)
+    coefs_: Optional[np.ndarray] = field(default=None, repr=False)       # ridge: (19,) = 12 S + 5 CHS + 1 age + intercept
     gbrs_: Optional[Dict[str, GradientBoostingRegressor]] = field(default=None, repr=False)
 
     def _features(self, S: np.ndarray, chs: np.ndarray, age_years: np.ndarray = None) -> np.ndarray:
         """Concatenate (N, n_feat), (N, n_comp) and the (N,) age column.
 
+        S is used raw (not scaled) and ``age_years`` is in years (run-days / 365).
         Age is included for the same reason as in
         :class:`~pqdna.chs.ComponentHealthScorer`: the EWMA state S is a
         stress-*level* estimate and carries no exposure-duration information,
@@ -65,14 +81,19 @@ class RULEstimator:
         ttf_days: np.ndarray,
         age_years: np.ndarray = None,
     ) -> RULEstimator:
-        """ttf_days is the *minimum* across components for a given snapshot, but
-        we fit one regressor per component using the per-component CHS slope
-        as the discriminator.
+        """Fit the selected head to ``ttf_days``, the days from each snapshot to failure.
+
+        A single regressor is fitted, not one per component: every component
+        head regresses the same target, and the CHS columns let the model tell
+        which component is closest to failure. For ``model='ridge'`` the closed
+        form is ``beta = (Z'Z + l2 I)^-1 Z'y`` with ``Z = [S, CHS, age_years, 1]``,
+        so the intercept is penalised like the other 18 coefficients and
+        ``coefs_`` has length 19. ``age_years`` is in years (run-days / 365).
         """
         X = self._features(S, chs, age_years)
         # We use the same ttf_days target for each component head; the per-
         # component CHS columns let each head distinguish which component is
-        # actually closest to threshold.
+        # actually closest to failure.
         y = ttf_days.astype(np.float64)
         if self.model == "ridge":
             X_aug = np.hstack([X, np.ones((X.shape[0], 1))])
@@ -102,6 +123,11 @@ class RULEstimator:
         chs: np.ndarray,
         age_years: np.ndarray = None,
     ) -> np.ndarray:
+        """Predicted days to failure, clamped at zero.
+
+        Ridge: ``max(0, [S, CHS, age_years, 1] @ coefs_)``. GBR: the minimum over
+        the component heads (which all alias one model), clamped at zero.
+        """
         X = self._features(S, chs, age_years)
         if self.model == "ridge":
             assert self.coefs_ is not None, "call fit() first"

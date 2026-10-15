@@ -6,9 +6,15 @@ import numpy as np
 from pqdna.chs import COMPONENTS, ComponentHealthScorer
 from pqdna.edge_export import memory_footprint_bytes
 from pqdna.features import FEATURE_NAMES, PQFeatureExtractor
-from pqdna.pqdna import PQDNAAggregator, PQDNAState, vectorised_damage
+from pqdna.pqdna import (
+    DEFAULT_TAU_S,
+    PQDNAAggregator,
+    PQDNAState,
+    _damage_nonlinearity,
+    vectorised_damage,
+)
 from pqdna.rul import RULEstimator
-from pqdna.synth import LATENT_DOSE_EXP, SyntheticMeterFleet, latent_dose
+from pqdna.synth import LATENT_DOSE_EXP, SyntheticMeterFleet, _AcceleratedSimulator, latent_dose
 
 
 def _clean_sine(fs=7680, line=60.0, dur_s=1.0, vp=325.0, ip=42.0):
@@ -177,3 +183,61 @@ def test_observation_noise_is_applied():
     clean = SyntheticMeterFleet(n_meters=4, years=5.0, seed=3, obs_noise=0.0).simulate()
     noisy = SyntheticMeterFleet(n_meters=4, years=5.0, seed=3, obs_noise=0.10).simulate()
     assert not np.allclose(clean[0].S_history, noisy[0].S_history)
+
+
+# ---------------------------------------------------------------------------
+# Regression guards for the time constants: the 1 s decay of a 60-day channel
+# is 1 - 1.9e-7, which float32 cannot represent.
+# ---------------------------------------------------------------------------
+
+
+def _tau_s():
+    return np.array([DEFAULT_TAU_S[n] for n in FEATURE_NAMES], dtype=np.float64)
+
+
+def test_aggregator_gain_is_exact_at_one_second():
+    agg = PQDNAAggregator(dt_window_s=1.0)
+    x = 1.0 / _tau_s()
+    # 1 - exp(-x) by its Taylor series, independent of expm1; x <= 1.2e-5.
+    series = x - x ** 2 / 2 + x ** 3 / 6
+    assert agg.alpha.dtype == np.float64 and agg.gain.dtype == np.float64
+    np.testing.assert_allclose(agg.gain, series, rtol=1e-12)
+    np.testing.assert_allclose(agg.alpha + agg.gain, 1.0, rtol=0, atol=1e-15)
+    # the effective time constant of the 1 s recursion is the nominal one
+    np.testing.assert_allclose(-1.0 / np.log(agg.alpha), _tau_s(), rtol=1e-6)
+
+
+def test_aggregator_update_matches_closed_form_and_keeps_dtype():
+    agg = PQDNAAggregator(dt_window_s=1.0)
+    v, i = _clean_sine()
+    feats = PQFeatureExtractor().extract(v, i)
+    # the aggregator's own (float64) kernel, so that only the update rule is tested
+    g = np.array(
+        [_damage_nonlinearity(n, float(x)) for n, x in zip(FEATURE_NAMES, feats.as_vector())]
+    )
+    state = PQDNAState()
+    assert state.S.dtype == np.float64
+    n = 500
+    for _ in range(n):
+        agg.update(state, feats)
+    expected = -np.expm1(-n * agg.dt / agg.tau) * g
+    np.testing.assert_allclose(state.S, expected, rtol=1e-5, atol=1e-12)
+    assert state.n_updates == n and state.t_last == n * agg.dt
+
+    # a caller-supplied float32 state stays float32
+    f32 = agg.update(PQDNAState(S=np.zeros(len(FEATURE_NAMES), dtype=np.float32)), feats)
+    assert f32.S.dtype == np.float32
+
+
+def test_simulator_daily_decay_is_the_exact_one_day_decay():
+    agg = PQDNAAggregator(dt_window_s=1.0)
+    alpha_day = _AcceleratedSimulator(agg).alpha
+    # every channel has its nominal time constant: 1, 7, 30 and 60 days
+    np.testing.assert_allclose(-1.0 / np.log(alpha_day), _tau_s() / 86400.0, rtol=1e-12)
+
+    # and it equals 86,400 one-second updates with a constant input
+    g = np.linspace(0.5, 3.0, len(FEATURE_NAMES))
+    S = np.zeros_like(g)
+    for _ in range(86400):
+        S += agg.gain * (g - S)
+    np.testing.assert_allclose(S, (1.0 - alpha_day) * g, rtol=1e-6)

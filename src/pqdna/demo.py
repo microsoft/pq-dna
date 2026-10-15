@@ -1,15 +1,19 @@
 """End-to-end PQ-DNA demo.
 
-Run with:
+Run with (from the repository root; it takes a few minutes):
     python -m pqdna.demo
 
-Produces:
+Produces, under ``out/`` in the current working directory:
   * `out/feature_importance.csv`
   * `out/chs_fit_metrics.csv`
+  * `out/ablation_metrics.csv`
   * `out/rul_metrics.csv`
   * `out/pqdna_model.h`           (fixed-point firmware header)
   * `out/footprint.json`
+  * `out/fixed_point_check.json`  (integer model vs float model on held-out snapshots)
   * `out/sample_meter_trace.csv`  (a single meter's PQ-DNA + CHS trajectory)
+
+Every published number in README.md and docs/METHOD.md comes from these files.
 """
 
 # Copyright (c) Microsoft Corporation.
@@ -31,7 +35,7 @@ from . import (
     SyntheticMeterFleet,
 )
 from .chs import COMPONENTS
-from .edge_export import export_c_header, memory_footprint_bytes
+from .edge_export import FixedPointModel, export_c_header, memory_footprint_bytes
 from .features import FEATURE_NAMES
 
 OUT = Path("out")
@@ -39,7 +43,7 @@ OUT.mkdir(exist_ok=True)
 
 
 def _split_by_meter(traces, frac_train: float = 0.8):
-    """Boolean row mask for a *meter-disjoint* train/test split."""
+    """Boolean row mask for a *meter-disjoint* split: the first 80% of meters train."""
     cut = int(frac_train * len(traces))
     train_ids = {t.meter_id for t in traces[:cut]}
     mask = []
@@ -51,6 +55,31 @@ def _split_by_meter(traces, frac_train: float = 0.8):
 def _chs_mae(scorer, S, age_years, CHS_true):
     pred = scorer.score_batch(S, age_years if scorer.use_age else 0.0)
     return np.mean(np.abs(pred - CHS_true), axis=0)
+
+
+def _fixed_point_check(agg, scorer, rul, S, age_days, stride: int = 10) -> dict:
+    """Largest gap between the integer model of the exported header and the float model.
+
+    Every ``stride``-th snapshot is scored twice, S -> CHS -> RUL: with the float
+    scorer and ridge head, and with `FixedPointModel`, the bit-exact reference of the
+    C header (S is quantised to Q15.48, the run-day counter is the age in whole days).
+    """
+    model = FixedPointModel.from_models(agg, scorer, rul)
+    rows = np.arange(0, len(S), stride)
+    days = np.rint(age_days[rows]).astype(np.int64)
+    chs_f = scorer.score_batch(S[rows], days / 365.0)
+    rul_f = rul.predict_days(S[rows], chs_f, days / 365.0)
+    max_chs = max_rul = 0.0
+    for r, i in enumerate(rows):
+        S_q = model.state_to_q(S[i])
+        chs_q = model.chs_q16(S_q, int(days[r]))
+        max_chs = max(max_chs, float(np.max(np.abs(np.array(chs_q) / 65536.0 - chs_f[r]))))
+        max_rul = max(max_rul, abs(model.rul_days(S_q, chs_q, int(days[r])) - float(rul_f[r])))
+    return {
+        "snapshots": int(len(rows)),
+        "max_abs_chs_error": max_chs,
+        "max_abs_rul_error_days": max_rul,
+    }
 
 
 def _evaluate(generator: str, use_age: bool, n_meters=300, years=15.0, seed=42):
@@ -134,6 +163,8 @@ def main() -> None:
             fh.write(f"{gen},{ua},{ov:.4f},{bs:.4f},{bs / max(ov, 1e-9):.3f}\n")
 
     print("[4/7] Fitting Remaining-Useful-Life regressor (ridge head) ...")
+    # NB: the RUL head is fitted and scored with the simulator's ground-truth CHS,
+    # not with the output of the scorer above.
     rul = RULEstimator(model="ridge", l2=10.0)
     rul.fit(S[train_mask], CHS[train_mask], ttf[train_mask], age_y[train_mask])
     yhat = rul.predict_days(S[~train_mask], CHS[~train_mask], age_y[~train_mask])
@@ -171,6 +202,12 @@ def main() -> None:
     with open(OUT / "footprint.json", "w", encoding="utf-8") as fh:
         json.dump(foot, fh, indent=2)
     print(f"      wrote {out_h}, footprint: {foot['total_bytes']} bytes total")
+    check = _fixed_point_check(agg, scorer, rul, S[~train_mask], age_days[~train_mask])
+    with open(OUT / "fixed_point_check.json", "w", encoding="utf-8") as fh:
+        json.dump(check, fh, indent=2)
+    print(f"      integer model vs float model on {check['snapshots']} held-out snapshots: "
+          f"max |CHS error| = {check['max_abs_chs_error']:.1e}, "
+          f"max |RUL error| = {check['max_abs_rul_error_days']:.2f} d")
 
     print("[6/7] Sample meter trajectory ...")
     sample = next((t for t in traces if t.failed_component is not None), traces[0])

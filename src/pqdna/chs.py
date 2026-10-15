@@ -3,10 +3,20 @@
 Maps the lifetime PQ-DNA stress vector to a per-subsystem health score in
 [0.0, 1.0], where 1.0 = factory-new and 0.0 = end-of-life.
 
-The mapping is `CHS_i = clip(1 - W_i . S - bias_i, 0, 1)` with W learned from
-accelerated-life-test (ALT) data. In this reference implementation we hand-
-wire W from documented physics-of-failure correlations, then refine the
-weights using the synthetic survival data in `synth.py`.
+For component ``c`` the mapping is
+
+    CHS_c = clip(1 - W_c . phi - b_c, 0, 1)
+    phi   = scale * [S, age_years * S]            (24 inputs; scale = 1e-3)
+
+where ``S`` is the 12-value PQ-DNA state, ``age_years`` is the device age in
+years (run-days / 365) and ``[A, B]`` concatenates. Without the age block
+(``use_age=False``) ``phi = scale * S`` has 12 inputs. W is learned from
+accelerated-life-test (ALT) data. In this reference implementation the first 12
+weights are hand-wired from documented physics-of-failure correlations
+(`FAILURE_MODES`) and the age block starts at zero; `fit` then replaces them
+using the synthetic survival data in `synth.py`.
+
+See docs/METHOD.md, Sections 3.1-3.2.
 """
 
 # Copyright (c) Microsoft Corporation.
@@ -27,7 +37,10 @@ COMPONENTS: List[str] = ["relay", "smps", "terminal_block", "mcu", "display"]
 
 
 # Physics-of-failure mapping. For each subsystem we list the PQ-DNA dimensions
-# that drive its dominant failure modes, with a (qualitative) weight.
+# that drive its dominant failure modes, with a (qualitative) weight. The
+# weights of each subsystem sum to 1. They are the prior for the first 12
+# entries of W (see ComponentHealthScorer) and the Miner's-rule weights w_ck of
+# the latent ground truth in synth.py.
 FAILURE_MODES: Dict[str, Dict[str, float]] = {
     "relay": {
         # Contact erosion from arc events on inrush; transient overvoltages stress coil.
@@ -81,11 +94,24 @@ def _weight_vector(component: str) -> np.ndarray:
 class ComponentHealthScorer:
     """Linear scorer over the PQ-DNA state, fitted from labelled survival data.
 
-    The estimator predicts accumulated damage as a linear function of the
-    design matrix and maps it to health with ``CHS = clip(1 - damage, 0, 1)``.
+    The estimator predicts the accumulated damage of component ``c`` as a linear
+    function of the design vector ``phi = scale * [S, age_years * S]`` (or
+    ``scale * S`` when ``use_age`` is False), ``damage_c = W_c . phi + b_c``, and
+    maps it to health with ``CHS_c = clip(1 - damage_c, 0, 1)``. ``S`` is the raw
+    (unscaled) PQ-DNA state and ``age_years`` the device age in years
+    (run-days / 365).
 
     Parameters
     ----------
+    W : np.ndarray, optional
+        Weights, shape ``(n_components, n_inputs)``. Defaults to the
+        physics-of-failure prior: `FAILURE_MODES` in the first 12 columns and
+        zeros in the age block.
+    bias : np.ndarray, optional
+        Bias ``b``, shape ``(n_components,)``. Defaults to zeros.
+    scale : float, default 1e-3
+        Fixed stress-to-health scale ``s`` applied to ``S``. `pqdna.edge_export`
+        folds it into the exported weights.
     use_age : bool, default True
         Include the ``S x age`` interaction block in the design matrix.
 
@@ -127,7 +153,11 @@ class ComponentHealthScorer:
         return N_FEATURES * (2 if self.use_age else 1)
 
     def _design(self, S: np.ndarray, age_years) -> np.ndarray:
-        """Build the (N, n_inputs) design matrix from raw S and age."""
+        """Build the (N, n_inputs) design matrix ``phi`` from raw S and age.
+
+        ``phi = scale * [S, age_years * S]``, or ``scale * S`` when ``use_age``
+        is False. ``age_years`` is the device age in years (run-days / 365).
+        """
         Sm = np.atleast_2d(np.asarray(S, dtype=np.float64)) * self.scale
         if not self.use_age:
             return Sm
@@ -135,13 +165,16 @@ class ComponentHealthScorer:
         return np.hstack([Sm, Sm * age])
 
     def score_batch(self, S: np.ndarray, age_years=0.0) -> np.ndarray:
-        """Vectorised CHS for a batch of states. Returns (N, n_components)."""
+        """Vectorised CHS for a batch of states. Returns (N, n_components).
+
+        ``age_years`` is a scalar or an (N,) array of device ages in years.
+        """
         X = self._design(S, age_years)
         damage = X @ self.W.T + self.bias
         return np.clip(1.0 - damage, 0.0, 1.0)
 
     def score(self, state: PQDNAState, age_years: float = 0.0) -> Dict[str, float]:
-        """Return CHS_i in [0,1] for each component."""
+        """Return CHS_c in [0, 1] for each component; ``age_years`` is run-days / 365."""
         chs = self.score_batch(state.S[None, :], age_years)[0]
         return {c: float(chs[i]) for i, c in enumerate(COMPONENTS)}
 
@@ -155,7 +188,9 @@ class ComponentHealthScorer:
     ) -> ComponentHealthScorer:
         """Refine W and bias by ridge regression on ``damage = 1 - CHS_target``.
 
-        The clip is ignored during the fit; it is re-applied at scoring time.
+        Closed form: minimise ``sum_n (damage_n - W . phi_n - b)^2 + l2 * (|W|^2 + b^2)``.
+        The bias is penalised like the weights. The clip is ignored during the
+        fit; it is re-applied at scoring time.
         """
         if self.use_age and age_years is None:
             raise ValueError("age_years is required when use_age=True")

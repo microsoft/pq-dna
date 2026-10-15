@@ -1,9 +1,11 @@
 """Per-cycle power-quality feature extraction from waveform samples.
 
-These are the features the meter MCU computes once per `WINDOW_CYCLES` mains
+These are the features a meter MCU would compute once per `WINDOW_CYCLES` mains
 cycles (e.g. once per second at 60 cycles @ 60 Hz). They are deliberately
-restricted to operations a fixed-point DSP can do in O(N log N) on an
-ARM-Cortex-M4-class core: rFFT, abs, RMS, simple thresholding.
+restricted to operations a fixed-point DSP can in principle do in O(N log N) on a
+Cortex-M4-class core: rFFT, abs, RMS, simple thresholding. This NumPy
+implementation is the reference; it has not been ported to or measured on a
+microcontroller.
 """
 
 # Copyright (c) Microsoft Corporation.
@@ -26,16 +28,16 @@ class PQFeatures:
     """One window of power-quality features. Order MUST match `FEATURE_NAMES`."""
     v_rms: float          # voltage RMS (per-unit; 1.0 = nominal)
     i_rms: float          # current RMS (per-unit; 1.0 = service-rating)
-    v_thd: float          # voltage total harmonic distortion (fraction, e.g. 0.05)
-    i_thd: float          # current THD (fraction)
+    v_thd: float          # voltage THD: RSS of harmonics 2-15 / fundamental (fraction, e.g. 0.05)
+    i_thd: float          # current THD, same definition (fraction)
     i_crest: float        # current crest factor = peak / RMS
-    transient_pu: float   # peak transient excursion |Δv|/V_nom in the window
-    sag_dwell: float      # fraction of window with v_rms < 0.9 pu
-    swell_dwell: float    # fraction of window with v_rms > 1.1 pu
-    flicker_pst: float    # short-term flicker index (Pst, IEC 61000-4-15-like)
+    transient_pu: float   # largest sample-to-sample voltage step |Δv|/V_nom in the window
+    sag_dwell: float      # fraction of mains cycles in the window with cycle RMS < 0.9 pu
+    swell_dwell: float    # fraction of mains cycles in the window with cycle RMS > 1.1 pu
+    flicker_pst: float    # short-term flicker proxy (crude; not an IEC 61000-4-15 Pst)
     freq_dev: float       # |f - f_nom| / f_nom
     unbalance: float      # voltage unbalance (single-phase: 0.0)
-    inrush_count: float   # # of |i| > 4 pu transitions per window
+    inrush_count: float   # upward crossings of |i| = 4 x i_rating per window
 
     def as_vector(self) -> np.ndarray:
         return np.array(list(asdict(self).values()), dtype=np.float32)
@@ -48,8 +50,13 @@ N_FEATURES = len(FEATURE_NAMES)
 class PQFeatureExtractor:
     """Extracts a `PQFeatures` vector from one window of voltage / current samples.
 
-    Designed to be MCU-friendly: 1× rFFT of length `WINDOW_CYCLES * samples_per_cycle`,
-    plus O(N) sample-domain stats. No floating-point library calls beyond sqrt.
+    Intended to be MCU-friendly: one rFFT of length `WINDOW_CYCLES * samples_per_cycle`
+    plus O(N) sample-domain statistics. This NumPy reference also uses a Hann window,
+    a standard deviation and moving averages, and has not been measured on a
+    microcontroller.
+
+    ``v_nominal`` (volts) and ``i_rating`` (amps) are the per-unit bases of the
+    voltage and current features (1.0 = nominal voltage / rated current).
     """
 
     def __init__(
@@ -70,7 +77,10 @@ class PQFeatureExtractor:
 
     # ---- core feature ops ---------------------------------------------------
     def _thd(self, x: np.ndarray) -> float:
-        """THD computed against the fundamental bin of an rFFT."""
+        """THD against the fundamental bin of a Hann-windowed rFFT.
+
+        Root-sum-square of harmonics 2..15 divided by the fundamental magnitude.
+        """
         n = len(x)
         X = np.fft.rfft(x * np.hanning(n))
         mag = np.abs(X)
